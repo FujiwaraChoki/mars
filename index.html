@@ -1,0 +1,1060 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Mars Valley — Sunrise</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #ffd9b0; font-family: ui-monospace, Menlo, monospace; text-align: center;
+    background: radial-gradient(ellipse at center, rgba(20,8,4,.55), rgba(0,0,0,.85));
+    cursor: pointer; user-select: none; transition: opacity .4s; z-index: 4;
+  }
+  #hud.hidden { opacity: 0; pointer-events: none; }
+  #hud h1 { font-weight: 400; letter-spacing: .35em; margin: 0 0 .6em; font-size: 22px; }
+  #hud p { margin: .25em 0; font-size: 13px; opacity: .8; }
+  #tip {
+    position: fixed; left: 12px; bottom: 8.5vh; color: rgba(255,217,176,.55);
+    font: 11px ui-monospace, Menlo, monospace; letter-spacing: .08em; pointer-events: none;
+    z-index: 3;
+  }
+  .bar {
+    position: fixed; left: 0; right: 0; height: 7vh; background: #000;
+    z-index: 2; pointer-events: none;
+  }
+  #bar-top { top: 0; box-shadow: 0 2px 18px rgba(0,0,0,.8); }
+  #bar-bottom { bottom: 0; box-shadow: 0 -2px 18px rgba(0,0,0,.8); }
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 1;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(10,3,1,.45) 100%);
+  }
+  #stats {
+    position: fixed; right: 12px; bottom: 8.5vh; z-index: 3; pointer-events: none;
+    color: rgba(255,217,176,.85); font: 12px ui-monospace, Menlo, monospace;
+    letter-spacing: .06em; text-align: right; text-shadow: 0 1px 4px rgba(0,0,0,.8);
+  }
+  #fuelbar {
+    width: 150px; height: 6px; margin: 5px 0 0 auto;
+    border: 1px solid rgba(255,217,176,.4);
+  }
+  #fuelbar i { display: block; height: 100%; background: #ffb070; width: 100%; transition: width .15s; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div>
+    <h1>VALLES&nbsp;AURORAE</h1>
+    <p>Mars &middot; sunrise &middot; Olympus Mons on the horizon &middot; gravity 3.71 m/s&sup2;</p>
+    <p>click to walk &mdash; WASD move &middot; shift run &middot; space jump &middot; <b>hold left-click: rocket</b> &middot; <b>right-click: ultrafast</b> &middot; M music</p>
+    <p style="color:#7df5dc">follow the 17 energy cores down the valley to the summit of Olympus Mons</p>
+    <p style="color:#7df5dc">cores refuel your rocket &middot; fuel regenerates while you stand on the ground</p>
+    <p style="opacity:.5">drop an <b>interstellar.mp3</b> you own next to this file to score the scene</p>
+  </div>
+</div>
+<div id="tip">esc to release cursor &middot; M music</div>
+<div id="stats"><span id="statline"></span><div id="fuelbar"><i id="fuelfill"></i></div></div>
+<div class="bar" id="bar-top"></div>
+<div class="bar" id="bar-bottom"></div>
+<div id="vignette"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// ---------- deterministic noise (shared by mesh + walking physics) ----------
+function hash2(x, y) {
+  let h = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+  return h - Math.floor(h);
+}
+function vnoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi), b = hash2(xi + 1, yi);
+  const c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y, oct = 5) {
+  let s = 0, amp = 0.5, f = 1;
+  for (let i = 0; i < oct; i++) {
+    s += amp * vnoise(x * f, y * f);
+    amp *= 0.5; f *= 2.03;
+  }
+  return s; // ~[0,1)
+}
+// ridged multifractal — sharp eroded crests for canyon walls
+function rfbm(x, y, oct = 5) {
+  let s = 0, amp = 0.5, f = 1, w = 1;
+  for (let i = 0; i < oct; i++) {
+    let n = 1 - Math.abs(2 * vnoise(x * f, y * f) - 1);
+    n *= n * w;
+    w = THREE.MathUtils.clamp(n * 2, 0, 1);
+    s += amp * n;
+    amp *= 0.5; f *= 2.11;
+  }
+  return s;
+}
+
+// ---------- tileable noise for baked textures (fast integer hash; period = p) ----------
+function ihash(x, y) {
+  let n = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0;
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  n ^= n >>> 16;
+  return (n >>> 0) / 4294967296;
+}
+function thash(x, y, p) {
+  return ihash(((x % p) + p) % p, ((y % p) + p) % p);
+}
+function tvnoise(x, y, p) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = thash(xi, yi, p), b = thash(xi + 1, yi, p);
+  const c = thash(xi, yi + 1, p), d = thash(xi + 1, yi + 1, p);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function tfbm(u, v, oct, basePeriod) {
+  let s = 0, amp = 0.5, p = basePeriod;
+  for (let i = 0; i < oct; i++) { s += amp * tvnoise(u * p, v * p, p); amp *= 0.5; p *= 2; }
+  return s;
+}
+// tileable Worley/cellular — distance to nearest feature point = pebble shapes
+function tworley(u, v, C) {
+  const x = u * C, y = v * C;
+  const cx = Math.floor(x), cy = Math.floor(y);
+  let d = 8;
+  for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) {
+    const ox = thash(cx + i, cy + j, C);
+    const oy = thash(cx + i + 57, cy + j + 113, C);
+    const px = cx + i + ox - x, py = cy + j + oy - y;
+    const dd = px * px + py * py;
+    if (dd < d) d = dd;
+  }
+  return Math.sqrt(d);
+}
+
+// Valley runs along Z. Walls rise with |x|, floor meanders via a sine.
+const W = 1400, D = 1400;
+const meanderAt = z => Math.sin(z * 0.004) * 90 + Math.sin(z * 0.0013 + 2.1) * 140;
+function terrainHeight(x, z) {
+  const dx = x - meanderAt(z);
+  const t = Math.min(Math.abs(dx) / 420, 1);
+  const wallMask = t * t * (3 - 2 * t);
+  const wall = wallMask * 105;                                   // canyon walls
+  const crest = rfbm(x * 0.008 + 13.1, z * 0.008, 5) * 40 * wallMask; // eroded spurs/gullies
+  const ridges = fbm(x * 0.012, z * 0.012, 5) * 24;              // large undulation
+  const rocks  = fbm(x * 0.09 + 7.3, z * 0.09, 4) * 2.0;         // small rubble
+  const micro  = fbm(x * 0.5 + 3.7, z * 0.5, 3) * 0.35;          // ground roughness
+  const floorDunes = Math.max(0, 1 - t) *
+    Math.sin(dx * 0.07 + fbm(x * 0.01, z * 0.01) * 6) * 0.9;     // ripples on the floor
+  let h = wall + crest + ridges * (0.3 + 0.7 * t) + rocks + micro + floorDunes;
+  // Olympus Mons is real ground too — same formula as its distant mesh,
+  // so you can rocket over and land on the caldera rim
+  const oxm = x - 900, ozm = z + 6800;
+  const or = Math.hypot(oxm, ozm) / 4200;
+  if (or < 1.2) {
+    let oh = Math.pow(Math.max(0, 1 - or), 1.7) * 1600;
+    if (or < 0.13) oh -= (1 - or / 0.13) * 280;
+    oh += fbm(oxm * 0.0018 + 50, ozm * 0.0018, 4) * 160 * Math.max(0, 1 - or);
+    oh += rfbm(oxm * 0.0009 + 3, ozm * 0.0009, 4) * 220 * Math.max(0, 1 - or) * or;
+    oh += Math.max(0, 1 - Math.abs(or - 0.92) / 0.08) * 90;
+    h += Math.max(oh - 2, 0);
+  }
+  return h;
+}
+
+// ---------- renderer / scene / post ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0xb86f42, 0.0013);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 14000);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.32, 0.7, 0.82);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// ---------- baked regolith material: seamless color + normal + roughness ----------
+// One heightfield drives everything: wind-packed fines, a Worley pebble field,
+// clods, and desiccation cracks. Normals come from the height gradient, so
+// close-up ground actually catches the low sun instead of looking painted.
+function makeRegolith() {
+  const S = 1024;
+  const Hf = new Float32Array(S * S);
+  const Pb = new Float32Array(S * S); // pebble mask, for tint + roughness
+
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const u = x / S, v = y / S;
+      const fines = tfbm(u, v, 4, 8);          // metre-scale packed dust
+      const grain = tfbm(u, v, 3, 128);        // centimetre sand grain
+      let pb = Math.max(0, 1 - tworley(u, v, 180) * 1.55);   // ~12 cm pebbles
+      pb = pb * pb * (3 - 2 * pb);
+      let cl = Math.max(0, 1 - tworley(u, v, 44) * 1.25);    // ~50 cm clods
+      cl = cl * cl;
+      const ridge = 1 - Math.abs(2 * tvnoise(u * 16, v * 16, 16) - 1);
+      const crack = Math.pow(Math.max(0, (ridge - 0.86) / 0.14), 2);
+      const i = y * S + x;
+      Hf[i] = fines * 0.42 + grain * 0.14 + pb * 0.5 + cl * 0.32 - crack * 0.3;
+      Pb[i] = Math.min(1, pb + cl * 0.5);
+    }
+  }
+
+  const cv = (id) => { const c = document.createElement('canvas'); c.width = c.height = S; return c; };
+  const cC = cv(), cN = cv(), cR = cv();
+  const gC = cC.getContext('2d'), gN = cN.getContext('2d'), gR = cR.getContext('2d');
+  const iC = gC.createImageData(S, S), iN = gN.createImageData(S, S), iR = gR.createImageData(S, S);
+  const STR = 3.0; // normal strength
+
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const i = y * S + x, o = i * 4;
+      const h = Hf[i], pb = Pb[i];
+      // -- color: warm-neutral luminance detail; vertex colors supply the palette
+      let lum = 0.66 + (h - 0.55) * 0.6;
+      const sp = ihash(x * 3 + 1, y * 7 + 5);
+      if (sp > 0.99880) lum += 0.45;             // bright hematite speck
+      else if (sp < 0.00120) lum *= 0.4;         // dark basalt chip
+      lum = THREE.MathUtils.clamp(lum, 0.2, 1.25);
+      // pebbles read slightly grayer than the oxidized fines around them
+      const warm = 1 - pb * 0.35;
+      iC.data[o]     = Math.min(255, lum * 255);
+      iC.data[o + 1] = Math.min(255, lum * (0.93 + 0.07 * (1 - warm)) * 255);
+      iC.data[o + 2] = Math.min(255, lum * (0.86 + 0.14 * (1 - warm)) * 255);
+      iC.data[o + 3] = 255;
+      // -- normal from height gradient (wrapped, so it tiles)
+      const xl = Hf[y * S + ((x - 1 + S) % S)], xr = Hf[y * S + ((x + 1) % S)];
+      const yd = Hf[((y - 1 + S) % S) * S + x], yu = Hf[((y + 1) % S) * S + x];
+      let nx = (xl - xr) * STR, ny = (yd - yu) * STR, nz = 1;
+      const il = 1 / Math.sqrt(nx * nx + ny * ny + nz * nz);
+      iN.data[o]     = (nx * il * 0.5 + 0.5) * 255;
+      iN.data[o + 1] = (ny * il * 0.5 + 0.5) * 255;
+      iN.data[o + 2] = (nz * il * 0.5 + 0.5) * 255;
+      iN.data[o + 3] = 255;
+      // -- roughness: pebble tops are worn smoother than loose dust
+      const rough = THREE.MathUtils.clamp(0.97 - pb * 0.22, 0.6, 1) * 255;
+      iR.data[o] = iR.data[o + 1] = iR.data[o + 2] = rough;
+      iR.data[o + 3] = 255;
+    }
+  }
+  gC.putImageData(iC, 0, 0); gN.putImageData(iN, 0, 0); gR.putImageData(iR, 0, 0);
+
+  function tex(c, srgb) {
+    const t = new THREE.CanvasTexture(c);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping; // truly seamless, no mirror needed
+    // repeat stays (1,1): terrain chunks bake world-space UVs (1 tile = TILE metres)
+    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+    return t;
+  }
+  return { map: tex(cC, true), normalMap: tex(cN, false), roughnessMap: tex(cR, false) };
+}
+const reg = makeRegolith();
+
+// ---------- terrain material (shared by all streamed chunks) ----------
+const TILE = 22; // metres per detail-texture tile, baked into world-space UVs
+const terrainMat = new THREE.MeshStandardMaterial({
+  vertexColors: true,
+  map: reg.map,             // detail luminance multiplies the vertex palette
+  normalMap: reg.normalMap,
+  normalScale: new THREE.Vector2(1.1, 1.1),
+  roughnessMap: reg.roughnessMap,
+  roughness: 1,
+  metalness: 0,
+});
+
+// ---------- rocks: faceted ejecta, talus near the walls, pebbles on the floor ----------
+// Real Mars rocks are angular impact ejecta and spalled basalt — flat faces,
+// flattened resting pose, half sunk into the dust. Three displaced variants
+// with flat shading, placement biased toward the wall bases (talus aprons).
+function makeRockGeo(seed) {
+  const g = new THREE.IcosahedronGeometry(1, 3);
+  const p = g.attributes.position;
+  const vert = new THREE.Vector3();
+  for (let i = 0; i < p.count; i++) {
+    vert.set(p.getX(i), p.getY(i), p.getZ(i));
+    const lump  = fbm(vert.x * 1.4 + seed, vert.y * 1.1 + vert.z * 1.6, 4);
+    const facet = Math.abs(2 * vnoise(vert.x * 2.2 + seed * 3.1, (vert.y + vert.z) * 2.2) - 1);
+    vert.multiplyScalar(0.72 + lump * 0.55 - facet * 0.32);
+    vert.y *= 0.72;                                  // resting squash
+    if (vert.y < -0.34) vert.y = -0.34 - (Math.abs(vert.y) - 0.34) * 0.12; // sheared base
+    p.setXYZ(i, vert.x, vert.y, vert.z);
+  }
+  g.computeVertexNormals();
+  return g;
+}
+const rockMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff, roughness: 0.95, metalness: 0, flatShading: true,
+  map: reg.map.clone(), normalMap: reg.normalMap.clone(),
+  normalScale: new THREE.Vector2(0.7, 0.7),
+});
+rockMat.map.repeat.set(2, 2); rockMat.map.needsUpdate = true;
+rockMat.normalMap.repeat.set(2, 2); rockMat.normalMap.needsUpdate = true;
+
+// ---------- dynamic map: terrain streams in as chunks around you ----------
+// Every chunk is fully deterministic — heights, colors, rocks and pebbles all
+// derive from world coordinates, so revisiting a place regenerates it identically.
+const CHUNK = 180, CSEG = 56, VIEW_R = 5;
+const wallMaskAt = (x, z) => {
+  const t = Math.min(Math.abs(x - meanderAt(z)) / 420, 1);
+  return t * t * (3 - 2 * t);
+};
+const rockVariants = [makeRockGeo(11.3), makeRockGeo(47.2), makeRockGeo(83.7)];
+const cDustLow  = new THREE.Color(0x96491f); // valley-floor dust
+const cDustHigh = new THREE.Color(0xc97b3f); // sunwashed upper dust
+const cRockA    = new THREE.Color(0x5e2c14); // dark basalt stratum
+const cRockB    = new THREE.Color(0xa85f31); // pale sediment stratum
+const cCrevice  = new THREE.Color(0x40190b);
+const chunks = new Map();   // "cx,cz" -> Group | 'pending'
+const chunkQueue = [];
+const colliders = new Map(); // "cx,cz" -> [{x,z,top,r}] for boulders worth bumping into
+const chash = (cx, cz, i, salt) =>
+  hash2(cx * 157.31 + i * 7.97 + salt, cz * 113.57 + i * 3.31 + salt * 1.7);
+
+function buildChunk(cx, cz) {
+  const ox = (cx + 0.5) * CHUNK, oz = (cz + 0.5) * CHUNK;
+  const geo = new THREE.PlaneGeometry(CHUNK, CHUNK, CSEG, CSEG);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position, nrm = geo.attributes.normal, uv = geo.attributes.uv;
+  const colors = new Float32Array(pos.count * 3);
+  const tmp = new THREE.Color(), rockC = new THREE.Color();
+  const eps = 1.2;
+  for (let i = 0; i < pos.count; i++) {
+    const wx = pos.getX(i) + ox, wz = pos.getZ(i) + oz;
+    const h = terrainHeight(wx, wz);
+    pos.setY(i, h);
+    uv.setXY(i, wx / TILE, wz / TILE); // world-space UVs: texture flows across chunks
+    // analytic normal from the height function — seamless across chunk borders
+    const nx = terrainHeight(wx - eps, wz) - terrainHeight(wx + eps, wz);
+    const nz = terrainHeight(wx, wz - eps) - terrainHeight(wx, wz + eps);
+    const ny = 2 * eps;
+    const il = 1 / Math.hypot(nx, ny, nz);
+    nrm.setXYZ(i, nx * il, ny * il, nz * il);
+    // color: height + slope + strata (same recipe as before, now per chunk)
+    const slope = 1 - ny * il;
+    const k = THREE.MathUtils.clamp(h / 110, 0, 1);
+    tmp.copy(cDustLow).lerp(cDustHigh, Math.pow(k, 0.8));
+    const band = 0.5 + 0.5 * Math.sin(h * 0.55 + fbm(wx * 0.015, wz * 0.015) * 5);
+    rockC.copy(cRockA).lerp(cRockB, band);
+    tmp.lerp(rockC, THREE.MathUtils.smoothstep(slope, 0.18, 0.5));
+    const n = fbm(wx * 0.05 + 31.7, wz * 0.05, 3);
+    tmp.lerp(cCrevice, (1 - n) * 0.3);
+    colors[i * 3] = tmp.r; colors[i * 3 + 1] = tmp.g; colors[i * 3 + 2] = tmp.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const group = new THREE.Group();
+  const mesh = new THREE.Mesh(geo, terrainMat);
+  mesh.position.set(ox, 0, oz);
+  mesh.receiveShadow = true;
+  group.add(mesh);
+
+  // rocks (talus-biased) + pebbles (valley floor), one instanced mesh per chunk
+  const CAP = 64;
+  const inst = new THREE.InstancedMesh(
+    rockVariants[Math.floor(chash(cx, cz, 0, 5.5) * 3) % 3], rockMat, CAP);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+  const col = new THREE.Color();
+  const chunkColliders = [];
+  let placed = 0;
+  for (let i = 0; i < 26 && placed < CAP; i++) {
+    const x = ox + (chash(cx, cz, i, 1.1) - 0.5) * CHUNK;
+    const z = oz + (chash(cx, cz, i, 2.2) - 0.5) * CHUNK;
+    const wm = wallMaskAt(x, z);
+    if (chash(cx, cz, i, 3.3) > 0.18 + wm * 0.82) continue;
+    const s = 0.25 + Math.pow(chash(cx, cz, i, 4.4), 2.6) * 4.5;
+    e.set((chash(cx, cz, i, 5.7) - 0.5) * 0.35, chash(cx, cz, i, 6.6) * 6.28,
+          (chash(cx, cz, i, 7.7) - 0.5) * 0.35);
+    q.setFromEuler(e);
+    const sink = s * (0.04 + chash(cx, cz, i, 19) * 0.2);
+    const cy = terrainHeight(x, z) + s * 0.34 - sink;
+    m.compose(new THREE.Vector3(x, cy, z), q,
+              new THREE.Vector3(s * (0.8 + chash(cx, cz, i, 23) * 0.5), s,
+                                s * (0.8 + chash(cx, cz, i, 29) * 0.5)));
+    inst.setMatrixAt(placed, m);
+    // boulders big enough to matter become solid (pebbles stay walk-over)
+    if (s >= 0.55) chunkColliders.push({ x, z, top: cy + s * 0.45, r: s * 0.95 });
+    const dusty = THREE.MathUtils.clamp(1 - s / 3, 0, 1) * 0.45;
+    col.setHSL(0.045 + chash(cx, cz, i, 11) * 0.02,
+               0.18 + chash(cx, cz, i, 13) * 0.15 + dusty * 0.25,
+               0.16 + chash(cx, cz, i, 17) * 0.1 + dusty * 0.08);
+    inst.setColorAt(placed, col);
+    placed++;
+  }
+  for (let i = 0; i < 36 && placed < CAP; i++) {
+    const x = ox + (chash(cx, cz, i, 41.3) - 0.5) * CHUNK;
+    const z = oz + (chash(cx, cz, i, 53.9) - 0.5) * CHUNK;
+    if (wallMaskAt(x, z) > 0.45) continue; // pebbles collect on low ground
+    const s = 0.05 + Math.pow(chash(cx, cz, i, 61.1), 2) * 0.28;
+    e.set((chash(cx, cz, i, 67) - 0.5) * 0.5, chash(cx, cz, i, 71) * 6.28,
+          (chash(cx, cz, i, 73) - 0.5) * 0.5);
+    q.setFromEuler(e);
+    m.compose(new THREE.Vector3(x, terrainHeight(x, z) + s * 0.3, z), q,
+              new THREE.Vector3(s, s * 0.8, s));
+    inst.setMatrixAt(placed, m);
+    col.setHSL(0.05 + chash(cx, cz, i, 79) * 0.02, 0.42 + chash(cx, cz, i, 83) * 0.15,
+               0.21 + chash(cx, cz, i, 89) * 0.09);
+    inst.setColorAt(placed, col);
+    placed++;
+  }
+  inst.count = placed;
+  inst.castShadow = true;
+  inst.receiveShadow = true;
+  if (placed > 0) group.add(inst);
+  colliders.set(cx + ',' + cz, chunkColliders);
+
+  scene.add(group);
+  return group;
+}
+
+function updateChunks(px, pz) {
+  const ccx = Math.floor(px / CHUNK), ccz = Math.floor(pz / CHUNK);
+  for (let dz = -VIEW_R; dz <= VIEW_R; dz++) {
+    for (let dx = -VIEW_R; dx <= VIEW_R; dx++) {
+      const key = (ccx + dx) + ',' + (ccz + dz);
+      if (!chunks.has(key)) { chunks.set(key, 'pending'); chunkQueue.push([ccx + dx, ccz + dz]); }
+    }
+  }
+  // build nearest pending chunks; budget more when far behind (rocket mode)
+  let budget = chunkQueue.length > 60 ? 5 : chunkQueue.length > 24 ? 3 : 1;
+  while (budget > 0 && chunkQueue.length) {
+    chunkQueue.sort((a, b) =>
+      ((a[0] - ccx) ** 2 + (a[1] - ccz) ** 2) - ((b[0] - ccx) ** 2 + (b[1] - ccz) ** 2));
+    const [cx, cz] = chunkQueue.shift();
+    if (Math.max(Math.abs(cx - ccx), Math.abs(cz - ccz)) > VIEW_R + 1) {
+      chunks.delete(cx + ',' + cz); // overtaken before it was built
+      continue;
+    }
+    chunks.set(cx + ',' + cz, buildChunk(cx, cz));
+    budget--;
+  }
+  // retire chunks left far behind
+  for (const [key, g] of chunks) {
+    if (g === 'pending') continue;
+    const [cx, cz] = key.split(',').map(Number);
+    if (Math.max(Math.abs(cx - ccx), Math.abs(cz - ccz)) > VIEW_R + 1) {
+      scene.remove(g);
+      g.traverse(o => {
+        if (o.isInstancedMesh) o.dispose();
+        else if (o.isMesh) o.geometry.dispose();
+      });
+      chunks.delete(key);
+      colliders.delete(key);
+    }
+  }
+}
+// seed the spawn area synchronously so there's ground on frame one
+{
+  const sx = Math.floor(meanderAt(300) / CHUNK), sz = Math.floor(300 / CHUNK);
+  for (let dz = -2; dz <= 2; dz++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      chunks.set((sx + dx) + ',' + (sz + dz), buildChunk(sx + dx, sz + dz));
+    }
+  }
+}
+
+// ---------- sky: Mars pre-dawn — stars overhead, blue glow hugging the sun ----------
+const sunDir = new THREE.Vector3(0.25, 0.10, -1).normalize();
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide,
+  depthWrite: false,
+  uniforms: { sunDir: { value: sunDir } },
+  vertexShader: /* glsl */`
+    varying vec3 vDir;
+    void main() {
+      vDir = position;
+      vec4 p = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      gl_Position = p.xyww;
+    }`,
+  fragmentShader: /* glsl */`
+    varying vec3 vDir;
+    uniform vec3 sunDir;
+    float hash13(vec3 p) {
+      p = fract(p * 443.8975);
+      p += dot(p, p.yzx + 19.19);
+      return fract((p.x + p.y) * p.z);
+    }
+    void main() {
+      vec3 d = normalize(vDir);
+      float h = max(d.y, 0.0);
+      float s = max(dot(d, sunDir), 0.0);
+      // thin CO2 atmosphere: bright dusty band at the horizon,
+      // falling off fast to a near-black zenith where stars survive
+      vec3 horizon = vec3(0.78, 0.45, 0.24);
+      vec3 zenith  = vec3(0.035, 0.022, 0.028);
+      float atm = exp(-h * 4.5);
+      vec3 sky = mix(zenith, horizon, atm);
+      // dawn wedge brightens the sky only around the sun's azimuth
+      float wedge = pow(s, 3.0) * atm;
+      sky += vec3(0.55, 0.30, 0.13) * wedge * 1.2;
+      // the Martian inversion: cool blue scattering halo around the sun
+      sky += vec3(0.28, 0.42, 0.72) * pow(s, 30.0) * 0.85;
+      sky += vec3(0.55, 0.65, 0.88) * pow(s, 240.0) * 1.8;
+      // small pale sun disc with soft limb
+      sky += vec3(2.2, 2.0, 1.75) * smoothstep(0.99962, 0.99987, s);
+      // haze band hugging the horizon line
+      sky += vec3(0.30, 0.16, 0.09) * exp(-abs(d.y) * 16.0) * 0.7;
+      // stars: visible only where the sky is still dark
+      vec3 cell = floor(d * 280.0);
+      float st = hash13(cell);
+      float star = smoothstep(0.9975, 1.0, st);
+      float dark = 1.0 - clamp(length(sky) * 2.2, 0.0, 1.0);
+      sky += vec3(0.9, 0.92, 1.0) * star * dark * (0.4 + 0.6 * hash13(cell + 7.0));
+      gl_FragColor = vec4(sky, 1.0);
+    }`,
+});
+const skyMesh = new THREE.Mesh(new THREE.SphereGeometry(2000, 48, 24), skyMat);
+scene.add(skyMesh);
+
+// ---------- distant plains so Olympus Mons doesn't float ----------
+let plains;
+{
+  const pg = new THREE.PlaneGeometry(30000, 30000, 64, 64);
+  pg.rotateX(-Math.PI / 2);
+  const pp = pg.attributes.position;
+  for (let i = 0; i < pp.count; i++) {
+    const x = pp.getX(i), z = pp.getZ(i);
+    pp.setY(i, fbm(x * 0.0008, z * 0.0008, 4) * 120 - 8);
+  }
+  pg.computeVertexNormals();
+  plains = new THREE.Mesh(pg, new THREE.MeshStandardMaterial({
+    color: 0xa9653a, roughness: 1,
+  }));
+  plains.position.y = -4;
+  scene.add(plains);
+}
+
+// ---------- Olympus Mons — shield volcano on the horizon, baked aerial haze ----------
+{
+  const og = new THREE.PlaneGeometry(11000, 11000, 180, 180);
+  og.rotateX(-Math.PI / 2);
+  const pos = og.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+  const hazeLow = new THREE.Color(0xc87f52); // base dissolves into atmosphere
+  const darkTop = new THREE.Color(0x47241a);
+  const rimWarm = new THREE.Color(0xe89a5c);
+  const tmp = new THREE.Color();
+  const R = 4200, H = 1600;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    const r = Math.sqrt(x * x + z * z) / R;
+    let h = Math.pow(Math.max(0, 1 - r), 1.7) * H;
+    if (r < 0.13) h -= (1 - r / 0.13) * 280;                 // summit caldera
+    h += fbm(x * 0.0018 + 50, z * 0.0018, 4) * 160 * Math.max(0, 1 - r);
+    h += rfbm(x * 0.0009 + 3, z * 0.0009, 4) * 220 * Math.max(0, 1 - r) * r; // flank channels
+    h += Math.max(0, 1 - Math.abs(r - 0.92) / 0.08) * 90;    // basal escarpment
+    pos.setY(i, Math.max(h, 0));
+    const k = THREE.MathUtils.clamp(h / H, 0, 1);
+    tmp.copy(hazeLow).lerp(darkTop, Math.pow(k, 0.65));
+    tmp.lerp(rimWarm, Math.max(0, x / R) * 0.35 * k);
+    colors[i * 3] = tmp.r; colors[i * 3 + 1] = tmp.g; colors[i * 3 + 2] = tmp.b;
+  }
+  og.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  const olympus = new THREE.Mesh(og, new THREE.MeshBasicMaterial({
+    vertexColors: true, fog: false,
+  }));
+  olympus.position.set(900, -2, -6800);
+  scene.add(olympus);
+}
+
+// ---------- lights ----------
+const sun = new THREE.DirectionalLight(0xffb478, 3.2);
+sun.position.copy(sunDir).multiplyScalar(900);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+sun.shadow.camera.left = -260; sun.shadow.camera.right = 260;
+sun.shadow.camera.top = 260;  sun.shadow.camera.bottom = -260;
+sun.shadow.camera.far = 2200;
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.05;
+scene.add(sun, sun.target);
+// sky bounce: warm dusty light from above, cold soil bounce from below
+scene.add(new THREE.HemisphereLight(0xa8633c, 0x2c150c, 0.5));
+scene.add(new THREE.AmbientLight(0x1d0e08, 0.7));
+
+// ---------- procedural lens flare ----------
+function glowTexture(stops) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+  for (const [t, col] of stops) grad.addColorStop(t, col);
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 256, 256);
+  return new THREE.CanvasTexture(c);
+}
+const flareCore = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: glowTexture([[0, 'rgba(255,245,225,0.9)'], [0.25, 'rgba(255,190,130,0.35)'], [1, 'rgba(255,150,90,0)']]),
+  blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, transparent: true,
+}));
+flareCore.scale.set(380, 380, 1);
+const flareStreak = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: glowTexture([[0, 'rgba(180,210,255,0.5)'], [0.4, 'rgba(140,170,230,0.12)'], [1, 'rgba(120,150,220,0)']]),
+  blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, transparent: true,
+}));
+flareStreak.scale.set(2400, 80, 1);
+scene.add(flareCore, flareStreak);
+
+// ---------- energy cores: a glowing trail down the valley, up Olympus ----------
+const CORE_COUNT = 17;
+const beacons = [];
+let coresTaken = 0;
+{
+  const coreGeo = new THREE.OctahedronGeometry(0.9);
+  const coreGlow = glowTexture([[0, 'rgba(150,255,235,0.9)'], [0.4, 'rgba(60,200,190,0.25)'], [1, 'rgba(40,160,160,0)']]);
+  for (let i = 0; i < CORE_COUNT; i++) {
+    const z = 300 - i * 440;
+    // along the valley floor, then banking up the flank to the caldera
+    const x = z > -5400 ? meanderAt(z)
+      : 900 + (meanderAt(-5400) - 900) * THREE.MathUtils.clamp((z + 6800) / 1400, 0, 1);
+    const y = terrainHeight(x, z) + 2.2;
+    const core = new THREE.Mesh(coreGeo, new THREE.MeshStandardMaterial({
+      color: 0x0a2a28, emissive: 0x3df5dc, emissiveIntensity: 2.4,
+    }));
+    core.position.set(x, y, z);
+    const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: coreGlow, blending: THREE.AdditiveBlending,
+      transparent: true, depthWrite: false, fog: false, // pierces the haze: it's the trail
+    }));
+    halo.position.copy(core.position);
+    scene.add(core, halo);
+    beacons.push({ core, halo, baseY: y, taken: false });
+  }
+}
+
+// ---------- drifting dust (soft sprite particles) ----------
+const DUST = 1800;
+const dustGeo = new THREE.BufferGeometry();
+{
+  const p = new Float32Array(DUST * 3);
+  for (let i = 0; i < DUST; i++) {
+    p[i*3]   = (Math.random() - 0.5) * 500;
+    p[i*3+1] = Math.random() * 40 + 0.5;
+    p[i*3+2] = (Math.random() - 0.5) * 500;
+  }
+  dustGeo.setAttribute('position', new THREE.BufferAttribute(p, 3));
+}
+const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
+  color: 0xd98c58, size: 1.1, transparent: true, opacity: 0.28,
+  map: glowTexture([[0, 'rgba(255,255,255,1)'], [1, 'rgba(255,255,255,0)']]),
+  sizeAttenuation: true, depthWrite: false, blending: THREE.AdditiveBlending,
+}));
+scene.add(dust);
+
+// ---------- score: loops your interstellar.mp3 if present, else synth homage ----------
+let audioStarted = false, musicOn = true;
+let audioCtx = null, masterGain = null;
+const track = new Audio('interstellar.mp3');
+track.loop = true;
+track.volume = 0.7;
+let fileOk = null;
+track.addEventListener('canplaythrough', () => { if (fileOk === null) fileOk = true; });
+track.addEventListener('error', () => { fileOk = false; });
+
+const NOTE = n => 440 * Math.pow(2, (n - 69) / 12);
+const CHORDS = [
+  [57, 60, 64, 69], [53, 57, 60, 65], [60, 64, 67, 72], [55, 59, 62, 67],
+];
+function startSynth() {
+  if (audioCtx) return;
+  const ctx = audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  masterGain = ctx.createGain();
+  masterGain.gain.value = 0.55;
+  const delay = ctx.createDelay(2); delay.delayTime.value = 0.46;
+  const fb = ctx.createGain(); fb.gain.value = 0.38;
+  const damp = ctx.createBiquadFilter(); damp.type = 'lowpass'; damp.frequency.value = 2200;
+  delay.connect(damp); damp.connect(fb); fb.connect(delay);
+  const wet = ctx.createGain(); wet.gain.value = 0.5;
+  masterGain.connect(ctx.destination);
+  masterGain.connect(delay); delay.connect(wet); wet.connect(ctx.destination);
+
+  function organNote(freq, t, dur, vol, type = 'triangle') {
+    const o = ctx.createOscillator(), o2 = ctx.createOscillator(), g = ctx.createGain();
+    const f = ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 1600;
+    o.type = type; o.frequency.value = freq;
+    o2.type = 'sawtooth'; o2.frequency.value = freq; o2.detune.value = 5;
+    const g2 = ctx.createGain(); g2.gain.value = 0.25;
+    o.connect(g); o2.connect(g2); g2.connect(g); g.connect(f); f.connect(masterGain);
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.03);
+    g.gain.setValueAtTime(vol, t + dur * 0.7);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.3);
+    o.start(t); o2.start(t); o.stop(t + dur + 0.4); o2.stop(t + dur + 0.4);
+  }
+  function pad(midis, t, dur) {
+    for (const m of midis) {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      const f = ctx.createBiquadFilter(); f.type = 'lowpass';
+      f.frequency.setValueAtTime(300, t);
+      f.frequency.linearRampToValueAtTime(900, t + dur * 0.6);
+      o.type = 'sawtooth'; o.frequency.value = NOTE(m);
+      o.detune.value = (m % 2 ? 4 : -4);
+      o.connect(g); g.connect(f); f.connect(masterGain);
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.05, t + dur * 0.5);
+      g.gain.linearRampToValueAtTime(0.0001, t + dur + 1);
+      o.start(t); o.stop(t + dur + 1.2);
+    }
+  }
+  function bass(midi, t, dur) {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = 'sine'; o.frequency.value = NOTE(midi - 24);
+    o.connect(g); g.connect(masterGain);
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.16, t + 0.8);
+    g.gain.linearRampToValueAtTime(0.0001, t + dur + 0.5);
+    o.start(t); o.stop(t + dur + 0.6);
+  }
+  function tickClk(t) {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = 'square'; o.frequency.value = 2200;
+    const f = ctx.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 2600; f.Q.value = 8;
+    o.connect(f); f.connect(g); g.connect(masterGain);
+    g.gain.setValueAtTime(0.12, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
+    o.start(t); o.stop(t + 0.08);
+  }
+  const STEP = 0.25, ARP = [0, 2, 3, 2];
+  let step = 0, nextT = ctx.currentTime + 0.2;
+  setInterval(() => {
+    if (!musicOn) { nextT = Math.max(nextT, ctx.currentTime + 0.2); return; }
+    while (nextT < ctx.currentTime + 0.6) {
+      const chord = CHORDS[Math.floor(step / 16) % CHORDS.length];
+      if (step % 16 === 0) { pad(chord, nextT, 4); bass(chord[0], nextT, 4); }
+      organNote(NOTE(chord[ARP[step % 4]] + 12), nextT, STEP * 0.95, 0.10);
+      if (step % 16 === 8) organNote(NOTE(chord[3] + 12), nextT, STEP * 4, 0.05, 'sine');
+      if (step % 6 === 0) tickClk(nextT);
+      step++; nextT += STEP;
+    }
+  }, 100);
+}
+// ---------- sound effects: rocket thrust rumble + pickup chime ----------
+let sfxCtx = null, thrustGain = null;
+function initSfx() {
+  if (sfxCtx) return;
+  sfxCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const len = sfxCtx.sampleRate;
+  const buf = sfxCtx.createBuffer(1, len, sfxCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  const src = sfxCtx.createBufferSource();
+  src.buffer = buf; src.loop = true;
+  const lp = sfxCtx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 550;
+  thrustGain = sfxCtx.createGain(); thrustGain.gain.value = 0;
+  src.connect(lp); lp.connect(thrustGain); thrustGain.connect(sfxCtx.destination);
+  src.start();
+}
+function chime() {
+  if (!sfxCtx) return;
+  const t0 = sfxCtx.currentTime;
+  [880, 1318.5].forEach((f, k) => {
+    const o = sfxCtx.createOscillator(), g = sfxCtx.createGain();
+    o.type = 'sine'; o.frequency.value = f;
+    o.connect(g); g.connect(sfxCtx.destination);
+    g.gain.setValueAtTime(0.0001, t0 + k * 0.09);
+    g.gain.exponentialRampToValueAtTime(0.22, t0 + k * 0.09 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + k * 0.09 + 0.5);
+    o.start(t0 + k * 0.09); o.stop(t0 + k * 0.09 + 0.6);
+  });
+}
+
+function startAudio() {
+  if (audioStarted) return;
+  audioStarted = true;
+  initSfx();
+  if (fileOk !== false) {
+    track.play().catch(() => startSynth());
+    // if the file 404s after we tried, fall back
+    track.addEventListener('error', () => { if (!audioCtx) startSynth(); }, { once: true });
+  } else {
+    startSynth();
+  }
+}
+addEventListener('keydown', e => {
+  if (e.code !== 'KeyM') return;
+  musicOn = !musicOn;
+  if (!track.paused || fileOk) track.volume = musicOn ? 0.7 : 0;
+  if (masterGain) masterGain.gain.linearRampToValueAtTime(musicOn ? 0.55 : 0, audioCtx.currentTime + 0.4);
+});
+
+// ---------- player ----------
+const EYE = 1.7, G = 3.71;
+const FUEL_MAX = 100;
+let fuel = FUEL_MAX;
+const player = {
+  pos: new THREE.Vector3(0, 0, 300),
+  vel: new THREE.Vector3(),
+  yaw: Math.PI,
+  pitch: 0,
+  grounded: false,
+};
+player.pos.x = meanderAt(player.pos.z);
+player.pos.y = terrainHeight(player.pos.x, player.pos.z) + EYE;
+
+const keys = {};
+addEventListener('keydown', e => keys[e.code] = true);
+addEventListener('keyup',   e => keys[e.code] = false);
+
+// rocket mode: hold left mouse button to thrust along the look direction;
+// right mouse button is the ultrafast burn
+let boosting = false, ultra = false;
+addEventListener('mousedown', e => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  if (e.button === 0) boosting = true;
+  if (e.button === 2) ultra = true;
+});
+addEventListener('mouseup', e => {
+  if (e.button === 0) boosting = false;
+  if (e.button === 2) ultra = false;
+});
+addEventListener('contextmenu', e => e.preventDefault());
+
+let mode = 'intro';
+let introT = 0;
+
+const hud = document.getElementById('hud');
+hud.addEventListener('click', () => { startAudio(); renderer.domElement.requestPointerLock(); });
+document.addEventListener('pointerlockchange', () => {
+  const locked = document.pointerLockElement === renderer.domElement;
+  hud.classList.toggle('hidden', locked);
+  if (locked && mode === 'intro') {
+    mode = 'play';
+    player.pos.x = camera.position.x;
+    player.pos.z = camera.position.z;
+    player.pos.y = Math.max(camera.position.y, terrainHeight(player.pos.x, player.pos.z) + EYE);
+    player.vel.set(0, 0, 0);
+    player.yaw = Math.PI; player.pitch = 0;
+  }
+});
+addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  player.yaw   -= e.movementX * 0.0022;
+  player.pitch -= e.movementY * 0.0022;
+  player.pitch = THREE.MathUtils.clamp(player.pitch, -1.5, 1.5);
+});
+
+// ---------- main loop ----------
+const clock = new THREE.Clock();
+function tick() {
+  requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  if (mode === 'intro') {
+    introT += dt;
+    const z = 560 - introT * 7;
+    const x = meanderAt(z) + Math.sin(introT * 0.13) * 18;
+    const y = terrainHeight(x, z) + 10 + 55 * Math.exp(-introT * 0.05);
+    camera.position.set(x, y, z);
+    camera.lookAt(meanderAt(z - 1200) + 300, y + 30 + introT * 1.2, z - 1500);
+    camera.rotation.z += Math.sin(introT * 0.21) * 0.012;
+    updateChunks(camera.position.x, camera.position.z);
+    skyMesh.position.copy(camera.position);
+    updateDust(dt, t);
+    updateFlare();
+    sun.position.copy(camera.position).addScaledVector(sunDir, 900);
+    sun.target.position.copy(camera.position);
+    composer.render();
+    return;
+  }
+
+  // movement
+  const speed = keys.ShiftLeft || keys.ShiftRight ? 16 : 7;
+  const fwd = new THREE.Vector3(-Math.sin(player.yaw), 0, -Math.cos(player.yaw));
+  const right = new THREE.Vector3(-fwd.z, 0, fwd.x);
+  const wish = new THREE.Vector3();
+  if (keys.KeyW) wish.add(fwd);
+  if (keys.KeyS) wish.sub(fwd);
+  if (keys.KeyD) wish.add(right);
+  if (keys.KeyA) wish.sub(right);
+  if (wish.lengthSq() > 0) wish.normalize().multiplyScalar(speed);
+
+  const thrusting = (boosting || ultra) && fuel > 0;
+  if (thrusting) {
+    // rocket: thrust toward wherever you're looking, gravity overcome
+    const cp = Math.cos(player.pitch);
+    const look = new THREE.Vector3(
+      -Math.sin(player.yaw) * cp, Math.sin(player.pitch), -Math.cos(player.yaw) * cp);
+    player.vel.lerp(look.multiplyScalar(ultra ? 260 : 60), Math.min((ultra ? 1.6 : 2.2) * dt, 1));
+    player.grounded = false;
+    fuel = Math.max(0, fuel - (ultra ? 20 : 9) * dt);
+  } else {
+    const accel = player.grounded ? 10 : 2;
+    player.vel.x += (wish.x - player.vel.x) * Math.min(accel * dt, 1);
+    player.vel.z += (wish.z - player.vel.z) * Math.min(accel * dt, 1);
+    player.vel.y -= G * dt;
+    if (keys.Space && player.grounded) { player.vel.y = 4.5; player.grounded = false; }
+    if (player.grounded) fuel = Math.min(FUEL_MAX, fuel + 16 * dt);
+  }
+  if (thrustGain) thrustGain.gain.setTargetAtTime(thrusting ? (ultra ? 0.32 : 0.2) : 0, sfxCtx.currentTime, 0.08);
+
+  player.pos.addScaledVector(player.vel, dt);
+  const standOn = resolveRockCollisions();
+
+  const ground = Math.max(terrainHeight(player.pos.x, player.pos.z), standOn) + EYE;
+  if (player.pos.y <= ground) {
+    player.pos.y = ground;
+    player.vel.y = 0;
+    player.grounded = true;
+  } else {
+    player.grounded = false;
+  }
+
+  const moving = player.grounded && wish.lengthSq() > 0;
+  const bob = moving ? Math.sin(t * (speed > 10 ? 11 : 8)) * 0.05 : 0;
+
+  camera.position.copy(player.pos).y += bob;
+  camera.rotation.set(0, 0, 0);
+  camera.rotateY(player.yaw);
+  camera.rotateX(player.pitch);
+
+  // speed-feel: FOV widens under thrust, hard under ultrafast burn
+  const targetFov = ultra && fuel > 0 ? 98 : boosting && fuel > 0 ? 86 : 70;
+  if (Math.abs(camera.fov - targetFov) > 0.05) {
+    camera.fov += (targetFov - camera.fov) * Math.min(dt * 5, 1);
+    camera.updateProjectionMatrix();
+  }
+
+  updateChunks(player.pos.x, player.pos.z);
+  skyMesh.position.copy(camera.position);
+  plains.position.x = Math.round(camera.position.x / 4000) * 4000;
+  plains.position.z = Math.round(camera.position.z / 4000) * 4000;
+
+  const nearestCore = updateBeacons(dt, t);
+  updateStats(nearestCore);
+  updateDust(dt, t);
+  updateFlare();
+
+  sun.position.copy(player.pos).addScaledVector(sunDir, 900);
+  sun.target.position.copy(player.pos);
+
+  composer.render();
+}
+
+// cylinder collision against nearby boulders: push out sideways,
+// or report a stand-on height when you're above one
+function resolveRockCollisions() {
+  let standOn = -Infinity;
+  const pcx = Math.floor(player.pos.x / CHUNK), pcz = Math.floor(player.pos.z / CHUNK);
+  const feet = player.pos.y - EYE;
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const arr = colliders.get((pcx + dx) + ',' + (pcz + dz));
+      if (!arr) continue;
+      for (const c of arr) {
+        const rx = player.pos.x - c.x, rz = player.pos.z - c.z;
+        const d2 = rx * rx + rz * rz;
+        if (feet >= c.top - 0.3) {
+          if (d2 < (c.r * 0.85) ** 2) standOn = Math.max(standOn, c.top);
+          continue;
+        }
+        const minD = c.r + 0.4;
+        if (d2 < minD * minD && d2 > 1e-6) {
+          const d = Math.sqrt(d2), nx = rx / d, nz = rz / d;
+          player.pos.x = c.x + nx * minD;
+          player.pos.z = c.z + nz * minD;
+          const vn = player.vel.x * nx + player.vel.z * nz;
+          if (vn < 0) { player.vel.x -= nx * vn; player.vel.z -= nz * vn; }
+        }
+      }
+    }
+  }
+  return standOn;
+}
+
+function updateBeacons(dt, t) {
+  let nearest = Infinity;
+  for (const b of beacons) {
+    if (b.taken) continue;
+    b.core.rotation.y += dt * 1.5;
+    b.core.position.y = b.baseY + Math.sin(t * 1.8 + b.baseY) * 0.4;
+    b.halo.position.copy(b.core.position);
+    const d = player.pos.distanceTo(b.core.position);
+    // the halo grows with distance so the trail reads through the haze
+    const sc = THREE.MathUtils.clamp(d * 0.05, 5, 60);
+    b.halo.scale.set(sc, sc, 1);
+    if (d < 5) {
+      b.taken = true;
+      coresTaken++;
+      scene.remove(b.core, b.halo);
+      fuel = Math.min(FUEL_MAX, fuel + 35);
+      chime();
+    } else {
+      nearest = Math.min(nearest, d);
+    }
+  }
+  return nearest;
+}
+
+const statline = document.getElementById('statline');
+const fuelfill = document.getElementById('fuelfill');
+function updateStats(nearestCore) {
+  const spd = player.vel.length();
+  const alt = Math.max(0, player.pos.y - EYE - terrainHeight(player.pos.x, player.pos.z));
+  const distOl = Math.hypot(player.pos.x - 900, player.pos.z + 6800);
+  const core = coresTaken >= CORE_COUNT ? 'ALL CORES RECOVERED'
+    : `core ${(nearestCore / 1000).toFixed(2)} km`;
+  statline.textContent =
+    `${spd.toFixed(0)} m/s · alt ${alt.toFixed(0)} m · cores ${coresTaken}/${CORE_COUNT} · ${core} · Olympus ${(distOl / 1000).toFixed(1)} km`;
+  fuelfill.style.width = fuel.toFixed(0) + '%';
+  fuelfill.style.background = fuel < 25 ? '#ff5a3c' : '#ffb070';
+}
+
+function updateDust(dt, t) {
+  const p = dustGeo.attributes.position;
+  for (let i = 0; i < DUST; i++) {
+    let x = p.getX(i) + dt * 3.5, y = p.getY(i) + Math.sin(t * 0.5 + i) * dt * 0.4;
+    let dx = x - camera.position.x, dz = p.getZ(i) - camera.position.z;
+    if (dx > 250) x -= 500; if (dx < -250) x += 500;
+    let z = p.getZ(i);
+    if (dz > 250) z -= 500; if (dz < -250) z += 500;
+    p.setXYZ(i, x, y, z);
+  }
+  p.needsUpdate = true;
+}
+
+const camDir = new THREE.Vector3();
+function updateFlare() {
+  camera.getWorldDirection(camDir);
+  const facing = THREE.MathUtils.clamp((camDir.dot(sunDir) - 0.55) / 0.45, 0, 1);
+  flareCore.position.copy(camera.position).addScaledVector(sunDir, 1500);
+  flareStreak.position.copy(flareCore.position);
+  flareCore.material.opacity = facing * 0.85;
+  flareStreak.material.opacity = facing * 0.6;
+}
+tick();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
